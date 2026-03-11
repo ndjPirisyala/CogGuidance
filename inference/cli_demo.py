@@ -225,6 +225,7 @@ def generate_video(
             generator=torch.Generator().manual_seed(seed),  # Set the seed for reproducibility
         ).frames[0]
     # guidance fix - save the trace
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     trace_path = os.path.splitext(output_path)[0] + "_trace.json"
     with open(trace_path, "w") as f:
         json.dump(trace, f, indent=2)
