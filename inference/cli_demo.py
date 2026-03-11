@@ -36,6 +36,7 @@ from diffusers.utils import export_to_video, load_image, load_video
 
 # guidance fix
 import os,json
+import random, numpy as np
 # guidance fix ends
 
 
@@ -91,6 +92,19 @@ def generate_video(
     - seed (int): The seed for reproducibility.
     - fps (int): The frames per second for the generated video.
     """
+
+    # guidance fix (not exactly guidance) - to get the seed working (seed stopped working due to either GPU change or wrapper)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # guidance fix ends
+
+    # guidance fix - helper function
+    def rms_per_sample(x, eps=1e-8):
+        # x: (B, ...) -> scalar RMS averaged over batch
+        return (x.float().pow(2).mean() + eps).sqrt().item()
+    # guidance fix ends
 
     # 1.  Load the pre-trained CogVideoX pipeline with the specified precision (bfloat16).
     # add device_map="balanced" in the from_pretrained function and remove the enable_model_cpu_offload()
@@ -168,6 +182,37 @@ def generate_video(
         return callback_kwargs
     # guidance fix ends
 
+    # guidance fix - add wrapper to the schedular to log the model step size per denoising step
+    orig_step = pipe.scheduler.step
+
+    trace.setdefault("delta_model_rms", [])
+    trace.setdefault("x_t_rms", [])
+    trace.setdefault("x_prev_rms", [])
+
+    def step_wrapped(model_output, timestep, sample, *args, **kwargs):
+        # sample is x_t
+        out = orig_step(model_output, timestep, sample, *args, **kwargs)
+
+        x_t = sample
+
+        # CogVideoXDPMScheduler returns (latents, old_pred_original_sample)
+        if isinstance(out, tuple):
+            x_prev = out[0]  # x_{t-1}^{model}
+        else:
+            # fallback for schedulers that return an object
+            x_prev = out.prev_sample
+
+        delta = x_prev - x_t
+
+        trace["x_t_rms"].append(rms_per_sample(x_t))
+        trace["x_prev_rms"].append(rms_per_sample(x_prev))
+        trace["delta_model_rms"].append(rms_per_sample(delta))
+
+        return out  # IMPORTANT: return exactly what the original scheduler returns
+
+    pipe.scheduler.step = step_wrapped
+    # guidance fix ends
+
     # 3. Enable CPU offload for the model.
     # turn off if you have multiple GPUs or enough GPU memory(such as H100) and it will cost less time in inference
     # and enable to("cuda")
@@ -192,7 +237,7 @@ def generate_video(
             num_frames=num_frames,  # Number of frames to generate
             use_dynamic_cfg=True,  # This id used for DPM scheduler, for DDIM scheduler, it should be False
             guidance_scale=guidance_scale,
-            generator=torch.Generator().manual_seed(seed),  # Set the seed for reproducibility
+            generator=torch.Generator(device="cuda").manual_seed(seed),  # Set the seed for reproducibility
         ).frames[0]
     elif generate_type == "t2v":
         video_generate = pipe(
@@ -204,7 +249,7 @@ def generate_video(
             num_frames=num_frames,
             use_dynamic_cfg=True,
             guidance_scale=guidance_scale,
-            generator=torch.Generator().manual_seed(seed),
+            generator=torch.Generator(device="cuda").manual_seed(seed),
             # guidance fix - pass callback args to t2v pipe
             callback_on_step_end=cb_on_step_end,
             callback_on_step_end_tensor_inputs=["latents"],
@@ -222,7 +267,7 @@ def generate_video(
             num_frames=num_frames,
             use_dynamic_cfg=True,
             guidance_scale=guidance_scale,
-            generator=torch.Generator().manual_seed(seed),  # Set the seed for reproducibility
+            generator=torch.Generator(device="cuda").manual_seed(seed),  # Set the seed for reproducibility
         ).frames[0]
     # guidance fix - save the trace
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
