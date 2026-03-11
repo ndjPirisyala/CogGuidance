@@ -34,6 +34,10 @@ from diffusers import (
 )
 from diffusers.utils import export_to_video, load_image, load_video
 
+# guidance fix
+import os,json
+# guidance fix ends
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -141,6 +145,29 @@ def generate_video(
         pipe.scheduler.config, timestep_spacing="trailing"
     )
 
+    # guidance fix - define the callback
+    logging.info(f"Scheduler: {pipe.scheduler.__class__.__name__}")
+
+    trace = {"step": [], "timestep": [], "latents_rms": []}
+    snapshots = {} # save a few snapshots to inspect later
+
+    # choose sanps to save (0, mid, last)
+    snapshot_steps = {0, num_inference_steps // 2, num_inference_steps - 1}
+
+    def cb_on_step_end(pipe, step_index, timestep, callback_kwargs):
+        latents = callback_kwargs["latents"]
+        rms = latents.float().pow(2).mean().sqrt().item()
+        trace["step"].append(int(step_index))
+        trace["timestep"].append(int(timestep) if not isinstance(timestep, int) else timestep)
+        trace["latents_rms"].append(float(rms))
+
+        # save the 3 snaps
+        if step_index in snapshot_steps:
+            snapshots[str(step_index)] = latents.detach().to("cpu", dtype=torch.float16)
+
+        return callback_kwargs
+    # guidance fix ends
+
     # 3. Enable CPU offload for the model.
     # turn off if you have multiple GPUs or enough GPU memory(such as H100) and it will cost less time in inference
     # and enable to("cuda")
@@ -178,6 +205,11 @@ def generate_video(
             use_dynamic_cfg=True,
             guidance_scale=guidance_scale,
             generator=torch.Generator().manual_seed(seed),
+            # guidance fix - pass callback args to t2v pipe
+            callback_on_step_end=cb_on_step_end,
+            callback_on_step_end_tensor_inputs=["latents"],
+            # guidance fix ends
+
         ).frames[0]
     else:
         video_generate = pipe(
@@ -192,6 +224,16 @@ def generate_video(
             guidance_scale=guidance_scale,
             generator=torch.Generator().manual_seed(seed),  # Set the seed for reproducibility
         ).frames[0]
+    # guidance fix - save the trace
+    trace_path = os.path.splitext(output_path)[0] + "_trace.json"
+    with open(trace_path, "w") as f:
+        json.dump(trace, f, indent=2)
+    logging.info(f"Saved trace to: {trace_path}")
+
+    snap_path = os.path.splitext(output_path)[0] + "_latentsnap.pt"
+    torch.save(snapshots, snap_path)
+    logging.info(f"Saved latent snapshots (few steps) to: {snap_path}")
+    # guidance fix ends
     export_to_video(video_generate, output_path, fps=fps)
 
 
