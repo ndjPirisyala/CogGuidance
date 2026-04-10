@@ -20,6 +20,7 @@ import json
 import math
 import random
 from typing import Literal, Optional
+import hashlib
 
 import numpy as np
 import cv2
@@ -311,6 +312,7 @@ def generate_video(
                 K = guide_k
                 pack_T = x_full.shape[1]
                 start = max(0, min(pack_T - K, pack_T // 2 - K // 2))
+                logging.info(f"start - {start}")
                 x_win = x_full[:, start:start + K]  # (B,K,C,H,W)
 
                 frames = pipe.decode_latents(x_win)  # (B,3,K,H,W)
@@ -414,6 +416,9 @@ def generate_video(
     logging.info("About to call pipe(...)")
     video_generate = pipe(**common_kwargs).frames[0]
     logging.info("pipe(...) returned")
+
+    arr = np.asarray(video_generate)
+    print("frames_sha256:", hashlib.sha256(arr.tobytes()).hexdigest(), arr.shape, arr.dtype)
 
     # Metrics (CPU)
     flow_raw = flow_edge_metric(video_generate, flow_scale=0.25, normalize=False)

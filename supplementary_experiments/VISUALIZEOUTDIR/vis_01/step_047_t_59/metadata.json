@@ -1,0 +1,32 @@
+{
+  "step_index": 47,
+  "timestep": 59,
+  "x_full_shape": [
+    1,
+    21,
+    16,
+    60,
+    90
+  ],
+  "x_pair_shape": [
+    1,
+    2,
+    16,
+    60,
+    90
+  ],
+  "pair_start": 9,
+  "decoded_shape_bcthw": [
+    1,
+    3,
+    8,
+    480,
+    720
+  ],
+  "decoded_num_frames": 8,
+  "latent_slice_a": 9,
+  "latent_slice_b": 10,
+  "latent_panel_path": "VISUALIZEOUTDIR/vis_01/step_047_t_59/latent_pair_panel.png",
+  "decoded_grid_path": "VISUALIZEOUTDIR/vis_01/step_047_t_59/decoded_frames_grid.png",
+  "decoded_video_path": "VISUALIZEOUTDIR/vis_01/step_047_t_59/decoded_window.mp4"
+}
