@@ -185,6 +185,9 @@ def generate_video(
     guide_k: int = 2,
     guide_long_side: int = 256,
     guide_steps: int = 1,
+    guide_mode: str = "edge",
+    tf_layer_name: str = "",
+    tf_words: str = "girl,bike",
 ):
     # Seed everything
     random.seed(seed)
@@ -286,6 +289,34 @@ def generate_video(
     trace["x_t_rms"] = []
     trace["x_prev_rms"] = []
 
+    # TF_Guidance
+    if guide_mode == "token_feat" and tf_layer_name is not None:
+        token_feat_state = {
+            "hidden": None,
+            "attn": None,
+            "module_name": None,
+            "fired": False,
+        }
+
+        def clear_token_feat_state():
+            token_feat_state["hidden"] = None
+            token_feat_state["attn"] = None
+            token_feat_state["module_name"] = None
+            token_feat_state["fired"] = False
+
+        named_modules = dict(pipe.transformer.named_modules())
+        tf_module = named_modules[tf_layer_name]
+
+        def token_feat_hidden_hook(module, inputs, output):
+            token_feat_state["fired"] = True
+            token_feat_state["module_name"] = tf_layer_name
+
+            out = output[0] if isinstance(output, tuple) else output
+            token_feat_state["hidden"] = out
+
+        hidden_hook_handle = tf_module.register_forward_hook(token_feat_hidden_hook)
+
+
     def step_wrapped(model_output, timestep, sample, *args, **kwargs):
         out = orig_step(model_output, timestep, sample, *args, **kwargs)
         x_t = sample
@@ -320,97 +351,134 @@ def generate_video(
         delta_norm = delta_model_rms_list[step_index] if step_index < len(delta_model_rms_list) else delta_model_rms_list[-1]
 
         with torch.enable_grad():
-            lat_old = callback_kwargs["latents"]
-            lat_fp32 = lat_old.float()  # master copy for updates/grad accumulation
-
-            B, pack_T, C_lat, H_lat, W_lat = lat_fp32.shape
-            if pack_T < 2:
-                return callback_kwargs
-
-            decode_dtype = lat_old.dtype
-
-            g_total_full = torch.zeros_like(lat_fp32)  # full gradient accumulator
+            x_full = callback_kwargs["latents"].detach().requires_grad_(True)  # SAME as regular
+            g_total_full = torch.zeros_like(x_full)
             E_total = 0.0
 
-            # # loop over ALL adjacent packed pairs: (0,1), (1,2), ..., (pack_T-2, pack_T-1)
-            # for i in range(pack_T - 1):
-            pair_indices = []  # pair i means slices (i, i+1)
-            # trace.setdefault("guided_pair_indices", []).append([int(pair_indices[0]), int(pair_indices[1])])
+            pack_T = x_full.shape[1]
+            # pair_indices = [i for i in range(pack_T - 1)]
+            pair_indices = []
 
-            for i in pair_indices:
-                # fp32 leaf for this pair, but decode in fp16/bf16
-                x_pair_fp32 = lat_fp32[:, i:i+2].detach().requires_grad_(True)  # (B,2,C,H,W) fp32 leaf
-                x_pair = x_pair_fp32.to(dtype=decode_dtype)                     # cast for VAE decode
+            if guide_mode == "edge":
+                for i in pair_indices:
+                    logging.info(f"Pair start - {i}")
+                    x_pair = x_full[:, i:i+2]                 # view into x_full (no detach leaf!)
+                    frames = pipe.decode_latents(x_pair)      # (B,3,Tdec,H,W), often Tdec=8
+                    B, C, T, H, W = frames.shape
+                    assert C == 3 and T >= 2
 
-                # decode -> (B,3,Tdec,H_img,W_img)
-                # NOTE: In CogVideoX, Tdec is NOT guaranteed to equal the packed window length (2).
-                # For example, decoding a 2-slice packed window can yield Tdec=8 decoded frames.
-                frames = pipe.decode_latents(x_pair)
-                B2, C, T, H, W = frames.shape
-                # We only need TWO decoded frames to compute a flow/warp constraint.
-                # For a fair comparison with the "regular" guidance script, we use the FIRST two
-                # decoded frames (t=0 and t=1) regardless of Tdec.
-                if not (C == 3 and T >= 2):
-                    del x_pair_fp32, x_pair, frames
-                    continue
 
-                # downsample decoded frames for cheaper flow/edges
-                long_side = guide_long_side
-                sc = long_side / max(H, W)
-                h2 = max(8, int(H * sc))
-                w2 = max(8, int(W * sc))
+                    # downsample decoded frames for cheaper flow/edges
+                    long_side = guide_long_side
+                    sc = long_side / max(H, W)
+                    h2 = max(8, int(H * sc))
+                    w2 = max(8, int(W * sc))
 
-                # Downsample ALL decoded frames, then select t=0 and t=1.
-                frames_s = F.interpolate(
-                    frames.permute(0, 2, 1, 3, 4).reshape(B2 * T, 3, H, W),
-                    size=(h2, w2),
-                    mode="bilinear",
-                    align_corners=False
-                ).reshape(B2, T, 3, h2, w2)
+                    # Downsample ALL decoded frames, then select t=0 and t=1.
+                    frames_s = F.interpolate(
+                        frames.permute(0, 2, 1, 3, 4).reshape(B * T, 3, H, W),
+                        size=(h2, w2),
+                        mode="bilinear",
+                        align_corners=False
+                    ).reshape(B, T, 3, h2, w2)
 
-                # Match "regular" guidance behavior: compute loss over ALL adjacent decoded frames
-                # within this decoded chunk.
-                pairs = [(j, j + 1) for j in range(T - 1)]
-                E_sum = 0.0
-                for a, b in pairs:
-                    Ia = frames_s[:, a]  # (B,3,h2,w2)
-                    Ib = frames_s[:, b]
+                    # Match "regular" guidance behavior: compute loss over ALL adjacent decoded frames
+                    # within this decoded chunk.
+                    pairs = [(j, j+1) for j in range(T-1)]
+                    E_sum = 0.0
+                    for a, b in pairs:
+                        Ia = frames_s[:, a]  # (B,3,h2,w2)
+                        Ib = frames_s[:, b]
 
-                    # flow on CPU (stop-grad)
-                    Ia_u8 = (Ia[0].clamp(0, 1).permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
-                    Ib_u8 = (Ib[0].clamp(0, 1).permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
-                    flow = flow_farneback_np(Ia_u8, Ib_u8, scale=1.0)
+                        # flow on CPU (stop-grad)
+                        Ia_u8 = (Ia[0].clamp(0, 1).permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+                        Ib_u8 = (Ib[0].clamp(0, 1).permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+                        flow = flow_farneback_np(Ia_u8, Ib_u8, scale=1.0)
 
-                    Ea = sobel_mag_torch(Ia)  # (B,1,h2,w2)
-                    Eb = sobel_mag_torch(Ib)
+                        Ea = sobel_mag_torch(Ia)  # (B,1,h2,w2)
+                        Eb = sobel_mag_torch(Ib)
 
-                    Ea_n = Ea / (Ea.mean(dim=(2, 3), keepdim=True) + 1e-6)
-                    Eb_n = Eb / (Eb.mean(dim=(2, 3), keepdim=True) + 1e-6)
+                        Ea_n = Ea / (Ea.mean(dim=(2, 3), keepdim=True) + 1e-6)
+                        Eb_n = Eb / (Eb.mean(dim=(2, 3), keepdim=True) + 1e-6)
 
-                    Eb_w = warp_torch(Eb_n, flow)
-                    diff = Ea_n - Eb_w
-                    E_sum = E_sum + torch.sqrt(diff * diff + 1e-4).mean()
+                        Eb_w = warp_torch(Eb_n, flow)
+                        diff = Ea_n - Eb_w
+                        E_sum = E_sum + torch.sqrt(diff * diff + 1e-4).mean()
 
-                # average over adjacent pairs (scale-invariant to T)
-                E = E_sum / max(1, len(pairs))
-                E_total += float(E.detach().cpu())
+                    # IMPORTANT: gradient wrt x_full (same as regular)
+                    g_full = torch.autograd.grad(E_sum, x_full, retain_graph=False, create_graph=False)[0]
+                    g_total_full += g_full.detach()
+                    E_total += float(E_sum.detach().cpu())
 
-                # per-pair gradient (immediate backward; no giant graph)
-                g_pair = torch.autograd.grad(E, x_pair_fp32, retain_graph=False, create_graph=False)[0].detach()
+                    del frames, frames_s, g_full
 
-                # accumulate into full gradient tensor
-                g_total_full[:, i:i+2] += g_pair
+                    torch.cuda.empty_cache()
+            
+            # TF_Guidance
+            elif guide_mode == "token_feat":
+                clear_token_feat_state()
 
-                # aggressively free intermediates
-                del x_pair_fp32, x_pair, frames, frames_s, E_sum, E, g_pair
+                x_probe = x_full[:, :guide_k] 
 
-                torch.cuda.empty_cache()
+                prompt_embeds = callback_kwargs["prompt_embeds"]  
+                if prompt_embeds.shape[0] == 2 * x_probe.shape[0]:
+                    prompt_probe = prompt_embeds[:x_probe.shape[0]]   # or the cond half, depending on ordering
+                else:
+                    prompt_probe = prompt_embeds
+                # latent_model_input = torch.cat([x_full] * 2) if prompt_embeds.shape[0] == 2 * x_full.shape[0] else x_full
+                # latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, timestep)
+                # timestep_batch = timestep.expand(latent_model_input.shape[0])
+                timestep_batch = timestep.expand(x_probe.shape[0])
 
-        # global trust-region step (single lambda for the whole accumulated gradient)
+                # image_rotary_emb = (
+                #     pipe._prepare_rotary_positional_embeddings(height, width, latent_model_input.size(1), latent_model_input.device)
+                #     if pipe.transformer.config.use_rotary_positional_embeddings
+                #     else None
+                # )
+
+                with pipe.transformer.cache_context("cond_uncond"):
+                    _ = pipe.transformer(
+                        hidden_states=x_probe,
+                        encoder_hidden_states=prompt_probe,
+                        timestep=timestep_batch,
+                        image_rotary_emb=None,
+                        attention_kwargs=None,
+                        return_dict=False,
+                    )[0]
+            
+                logging.info(f"hook fired: {token_feat_state['fired']}")
+                logging.info(f"module: {token_feat_state['module_name']}")
+                logging.info(f"hidden shape: {None if token_feat_state['hidden'] is None else tuple(token_feat_state['hidden'].shape)}")
+                logging.info(f"attn shape: {None if token_feat_state['attn'] is None else tuple(token_feat_state['attn'].shape)}")
+
+                hidden = token_feat_state["hidden"]   # (B, Nvis, D)
+                B, Nvis, D = hidden.shape
+                T_probe = x_probe.shape[1]
+
+                assert Nvis % T_probe == 0
+                tokens_per_slice = Nvis // T_probe
+                logging.info(f"tokens_per_slice: {tokens_per_slice}")
+
+                H_tok, W_tok = 30, 45
+                assert H_tok * W_tok == tokens_per_slice
+
+                hidden_5d = hidden.view(B, T_probe, H_tok, W_tok, D)
+                logging.info(f"hidden_5d shape: {tuple(hidden_5d.shape)}")
+
+                g_total_full.zero_()
+                E_total = 0.0
+            
+            else:
+                raise ValueError(...)
+
+        # trust region
+        delta_norm = delta_model_rms_list[step_index]
         g_norm = float(rms(g_total_full))
         lam = float(rho_t * delta_norm / (g_norm + 1e-8))
 
-        lat_new = (lat_fp32 - lam * g_total_full).to(lat_old.dtype)
+        lat_old = callback_kwargs["latents"]
+        lat_new = (lat_old.float() - lam * g_total_full.float()).to(callback_kwargs["latents"].dtype)
+
         callback_kwargs["latents"] = lat_new
 
         # debug stats
@@ -422,7 +490,6 @@ def generate_video(
         trace.setdefault("grad_rms_decode", []).append(float(g_norm))
         trace.setdefault("max_abs_update", []).append(float(max_abs_update))
         trace.setdefault("num_changed", []).append(int(num_changed))
-        trace.setdefault("num_pairs_full", []).append(int(pack_T - 1))
 
         # snapshots (always)
         if step_index in snapshot_steps:
@@ -446,7 +513,7 @@ def generate_video(
     if guide:
         common_kwargs.update(
             callback_on_step_end=cb_on_step_end,
-            callback_on_step_end_tensor_inputs=["latents"],
+            callback_on_step_end_tensor_inputs=["latents", "prompt_embeds", "negative_prompt_embeds"],
         )
 
     if generate_type == "i2v":
@@ -504,6 +571,11 @@ if __name__ == "__main__":
     parser.add_argument("--guide_long_side", type=int, default=256, help="Downsample long side for guidance ops")
     parser.add_argument("--guide_steps", type=int, default=1, help="How many last denoise steps to guide")
 
+    # Token-Feature Guidance toggles
+    parser.add_argument("--guide_mode", type=str, default="edge", choices=["edge", "token_feat"])
+    parser.add_argument("--tf_layer_name", type=str, default="")
+    parser.add_argument("--tf_words", type=str, default="girl,bike")
+
     args = parser.parse_args()
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
 
@@ -528,4 +600,7 @@ if __name__ == "__main__":
         guide_k=args.guide_k,
         guide_long_side=args.guide_long_side,
         guide_steps=args.guide_steps,
+        guide_mode=args.guide_mode,
+        tf_layer_name=args.tf_layer_name,
+        tf_words=args.tf_words,
     )
