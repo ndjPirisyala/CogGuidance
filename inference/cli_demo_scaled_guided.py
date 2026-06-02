@@ -208,7 +208,7 @@ def generate_video(
             return (x.float().pow(2).mean() + eps).sqrt()
         return math.sqrt(float(x) * float(x) + eps)
 
-    def rho_schedule(i, N, rho_max=0.0015, p_on=0.90, p_peak=0.98, p_taper=0.99, rho_end=0.0001):
+    def rho_schedule(i, N, rho_max=0.0003, p_on=0.90, p_peak=0.98, p_taper=0.99, rho_end=0.0001):
         p = i / (N - 1)
         if p < p_on:
             return 0.0
@@ -296,6 +296,8 @@ def generate_video(
             "attn": None,
             "module_name": None,
             "fired": False,
+            "hidden_in": None,
+            "encoder_in": None,
         }
 
         def clear_token_feat_state():
@@ -303,6 +305,8 @@ def generate_video(
             token_feat_state["attn"] = None
             token_feat_state["module_name"] = None
             token_feat_state["fired"] = False
+            token_feat_state["hidden_in"] = None
+            token_feat_state["encoder_in"] = None
 
         named_modules = dict(pipe.transformer.named_modules())
         tf_module = named_modules[tf_layer_name]
@@ -314,7 +318,66 @@ def generate_video(
             out = output[0] if isinstance(output, tuple) else output
             token_feat_state["hidden"] = out
 
+        def token_feat_input_prehook(module, args, kwargs):
+            hidden_in = kwargs.get("hidden_states", None)
+            encoder_in = kwargs.get("encoder_hidden_states", None)
+
+            if hidden_in is None and len(args) > 0:
+                hidden_in = args[0]
+
+            if encoder_in is None and len(args) > 1:
+                encoder_in = args[1]
+
+            token_feat_state["hidden_in"] = hidden_in
+            token_feat_state["encoder_in"] = encoder_in
+
+        input_prehook_handle = tf_module.register_forward_pre_hook(
+            token_feat_input_prehook,
+            with_kwargs=True,
+        )
+
         hidden_hook_handle = tf_module.register_forward_hook(token_feat_hidden_hook)
+
+        # Token debug / lookup for token-feature guidance
+        tf_target_words = [w.strip().lower() for w in tf_words.split(",") if w.strip()]
+
+        def debug_prompt_tokens(pipe, prompt, target_words):
+            tokenizer = pipe.tokenizer
+
+            tok = tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=tokenizer.model_max_length,
+                add_special_tokens=True,
+            )
+
+            input_ids = tok["input_ids"][0].tolist()
+            tokens = tokenizer.convert_ids_to_tokens(input_ids)
+
+            # logging.info("=== Prompt tokens ===")
+            # for i, (tid, tstr) in enumerate(zip(input_ids, tokens)):
+            #     logging.info(f"[{i:03d}] id={tid:>6} token={tstr}")
+
+            target_positions = {}
+            for w in target_words:
+                matches = []
+                w_low = w.lower()
+                for i, tstr in enumerate(tokens):
+                    tnorm = tstr.lower()
+                    # handle common tokenization quirks like Ġword / ▁word / </w>
+                    tclean = tnorm.replace("ġ", "").replace("▁", "").replace("</w>", "")
+                    if w_low == tclean or w_low in tclean:
+                        matches.append(i)
+                target_positions[w] = matches
+                logging.info(f"target word '{w}' -> token positions {matches}")
+
+            return input_ids, tokens, target_positions
+
+        tf_input_ids, tf_tokens, tf_target_positions = debug_prompt_tokens(
+            pipe, prompt, tf_target_words
+        )
 
 
     def step_wrapped(model_output, timestep, sample, *args, **kwargs):
@@ -418,24 +481,20 @@ def generate_video(
             elif guide_mode == "token_feat":
                 clear_token_feat_state()
 
-                x_probe = x_full[:, :guide_k] 
+                # Small latent-time window only
+                x_probe = x_full[:, :guide_k]   # (B, T_probe, C, H, W)
+                T_probe = x_probe.shape[1]
 
-                prompt_embeds = callback_kwargs["prompt_embeds"]  
+                # Conditional text branch only
+                prompt_embeds = callback_kwargs["prompt_embeds"]
                 if prompt_embeds.shape[0] == 2 * x_probe.shape[0]:
-                    prompt_probe = prompt_embeds[:x_probe.shape[0]]   # or the cond half, depending on ordering
+                    prompt_probe = prompt_embeds[:x_probe.shape[0]]   # adjust later if cond half is second
                 else:
                     prompt_probe = prompt_embeds
-                # latent_model_input = torch.cat([x_full] * 2) if prompt_embeds.shape[0] == 2 * x_full.shape[0] else x_full
-                # latent_model_input = pipe.scheduler.scale_model_input(latent_model_input, timestep)
-                # timestep_batch = timestep.expand(latent_model_input.shape[0])
+
                 timestep_batch = timestep.expand(x_probe.shape[0])
 
-                # image_rotary_emb = (
-                #     pipe._prepare_rotary_positional_embeddings(height, width, latent_model_input.size(1), latent_model_input.device)
-                #     if pipe.transformer.config.use_rotary_positional_embeddings
-                #     else None
-                # )
-
+                # Probe the transformer so hooks/pre-hooks populate token_feat_state
                 with pipe.transformer.cache_context("cond_uncond"):
                     _ = pipe.transformer(
                         hidden_states=x_probe,
@@ -445,28 +504,109 @@ def generate_video(
                         attention_kwargs=None,
                         return_dict=False,
                     )[0]
-            
+
+                # Basic sanity checks
+                if not token_feat_state["fired"]:
+                    raise RuntimeError("token_feat hook did not fire")
+
+                hidden = token_feat_state["hidden"]          # expected: (B, Nvis, D)
+                hidden_in = token_feat_state["hidden_in"]    # expected: (B, Nvis, D)
+                encoder_in = token_feat_state["encoder_in"]  # expected: (B, Ntext, D)
+
+                if hidden is None or hidden_in is None or encoder_in is None:
+                    raise RuntimeError(
+                        f"Missing token-feature tensors: "
+                        f"hidden={hidden is not None}, "
+                        f"hidden_in={hidden_in is not None}, "
+                        f"encoder_in={encoder_in is not None}"
+                    )
+
+                B, Nvis, D = hidden.shape
+                assert Nvis % T_probe == 0, f"Nvis={Nvis} not divisible by T_probe={T_probe}"
+                tokens_per_slice = Nvis // T_probe
+
+                # Current known grid for your setup
+                H_tok, W_tok = 30, 45
+                assert H_tok * W_tok == tokens_per_slice, (
+                    f"Expected {H_tok}x{W_tok}={H_tok*W_tok}, got {tokens_per_slice}"
+                )
+
+                hidden_5d = hidden.view(B, T_probe, H_tok, W_tok, D)  # (B, T, H, W, D)
+
+                # ------------------------------------------------------------------
+                # Token-conditioned support maps from reconstructed q/k attention
+                # ------------------------------------------------------------------
+                # TEMP: keep hardcoded positions for now
+                target_token_positions = [1, 5]   # e.g. "girl", "bike"
+
+                q = tf_module.to_q(hidden_in)      # (B, Nvis, D)
+                k = tf_module.to_k(encoder_in)     # (B, Ntext, D)
+
+                _, Nvis_q, D_q = q.shape
+                _, Ntext, D_k = k.shape
+                assert D_q == D_k == D
+
+                heads = tf_module.heads
+                head_dim = D // heads
+                scale = head_dim ** -0.5
+
+                q = q.view(B, Nvis_q, heads, head_dim).transpose(1, 2)   # (B, H, Nvis, Hd)
+                k = k.view(B, Ntext, heads, head_dim).transpose(1, 2)    # (B, H, Ntext, Hd)
+
+                scores = torch.matmul(q, k.transpose(-1, -2)) * scale    # (B, H, Nvis, Ntext)
+                scores_mean = scores.mean(dim=1)                         # (B, Nvis, Ntext)
+
+                target_scores = scores_mean[:, :, target_token_positions]   # (B, Nvis, Ntok)
+                ntok = len(target_token_positions)
+
+                target_maps = target_scores.view(B, T_probe, H_tok, W_tok, ntok)   # (B, T, H, W, Ntok)
+                target_maps = target_maps.permute(0, 1, 4, 2, 3)                   # (B, T, Ntok, H, W)
+
+                # Spatial softmax per token, per slice
+                support_maps = torch.softmax(
+                    target_maps.reshape(B, T_probe, ntok, -1),
+                    dim=-1
+                ).view(B, T_probe, ntok, H_tok, W_tok)                              # (B, T, Ntok, H, W)
+
+                # ------------------------------------------------------------------
+                # Pool token-specific features and compute ONE token-feature energy
+                # ------------------------------------------------------------------
+                pooled_feats = []
+                for tok_idx in range(ntok):
+                    w = support_maps[:, :, tok_idx]                                 # (B, T, H, W)
+                    z_tok = (w.unsqueeze(-1) * hidden_5d).sum(dim=(2, 3))           # (B, T, D)
+                    z_tok = z_tok / (z_tok.norm(dim=-1, keepdim=True) + 1e-6)
+                    pooled_feats.append(z_tok)
+
+                pooled_feats = torch.stack(pooled_feats, dim=2)                     # (B, T, Ntok, D)
+
+                # Adjacent-slice cosine for each token
+                if T_probe < 2:
+                    raise RuntimeError("guide_k / T_probe must be at least 2 for temporal consistency")
+
+                adj_cos = (pooled_feats[:, :-1] * pooled_feats[:, 1:]).sum(dim=-1)  # (B, T-1, Ntok)
+
+                # One scalar energy only
+                E_tok = (1.0 - adj_cos).mean()
+
+                # Windowed gradient only
+                g_probe = torch.autograd.grad(
+                    E_tok, x_probe, retain_graph=False, create_graph=False
+                )[0]
+
+                g_total_full[:, :guide_k] += g_probe.detach()
+                E_total += float(E_tok.detach().cpu())
+
+                # Minimal logging
                 logging.info(f"hook fired: {token_feat_state['fired']}")
                 logging.info(f"module: {token_feat_state['module_name']}")
-                logging.info(f"hidden shape: {None if token_feat_state['hidden'] is None else tuple(token_feat_state['hidden'].shape)}")
-                logging.info(f"attn shape: {None if token_feat_state['attn'] is None else tuple(token_feat_state['attn'].shape)}")
-
-                hidden = token_feat_state["hidden"]   # (B, Nvis, D)
-                B, Nvis, D = hidden.shape
-                T_probe = x_probe.shape[1]
-
-                assert Nvis % T_probe == 0
-                tokens_per_slice = Nvis // T_probe
-                logging.info(f"tokens_per_slice: {tokens_per_slice}")
-
-                H_tok, W_tok = 30, 45
-                assert H_tok * W_tok == tokens_per_slice
-
-                hidden_5d = hidden.view(B, T_probe, H_tok, W_tok, D)
+                logging.info(f"hidden shape: {tuple(hidden.shape)}")
                 logging.info(f"hidden_5d shape: {tuple(hidden_5d.shape)}")
-
-                g_total_full.zero_()
-                E_total = 0.0
+                logging.info(f"support_maps shape: {tuple(support_maps.shape)}")
+                logging.info(f"pooled_feats shape: {tuple(pooled_feats.shape)}")
+                logging.info(f"E_tok: {float(E_tok.detach().cpu()):.6f}")
+                logging.info(f"g_tok_rms: {float(rms(g_probe)):.6f}")
+                logging.info(f"adjacent token cosines: {adj_cos.detach().cpu().tolist()}")
             
             else:
                 raise ValueError(...)

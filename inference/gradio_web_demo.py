@@ -10,7 +10,6 @@ Usage:
     OpenAI_API_KEY=your_openai_api_key OpenAI_BASE_URL=https://api.openai.com/v1 python inference/gradio_web_demo.py
 """
 
-import os
 import threading
 import time
 
