@@ -34,6 +34,9 @@ from diffusers import (
 )
 from diffusers.utils import export_to_video, load_image, load_video
 
+import matplotlib.pyplot as plt
+
+
 logging.basicConfig(level=logging.INFO)
 
 RESOLUTION_MAP = {
@@ -563,10 +566,85 @@ def generate_video(
                 target_maps = target_maps.permute(0, 1, 4, 2, 3)                   # (B, T, Ntok, H, W)
 
                 # Spatial softmax per token, per slice
+                # support_maps = torch.softmax(
+                #     target_maps.reshape(B, T_probe, ntok, -1),
+                #     dim=-1
+                # ).view(B, T_probe, ntok, H_tok, W_tok)                              # (B, T, Ntok, H, W)
+
+                # normalize each map before softmax
+                flat = target_maps.reshape(B, T_probe, ntok, -1)
+                flat = (flat - flat.mean(dim=-1, keepdim=True)) / (flat.std(dim=-1, keepdim=True) + 1e-6)
+                support_maps = torch.softmax(flat, dim=-1).view(B, T_probe, ntok, H_tok, W_tok)
+
+                # Temperature softmax per token, per slice
+                tau = 5.0  # try 2, 5, 10, 20
                 support_maps = torch.softmax(
-                    target_maps.reshape(B, T_probe, ntok, -1),
+                    target_maps.reshape(B, T_probe, ntok, -1) / tau,
                     dim=-1
-                ).view(B, T_probe, ntok, H_tok, W_tok)                              # (B, T, Ntok, H, W)
+                ).view(B, T_probe, ntok, H_tok, W_tok)
+
+                # Save one debug figure at the first guided step
+                if step_index == min(guided_decode_steps):
+
+                    token_names = ["girl", "bike"]   # adjust if needed
+                    B0 = 0
+                    tau = 1.0  # current softmax temperature
+
+                    # target_maps: (B, T, Ntok, H, W)
+                    # support_maps: (B, T, Ntok, H, W)
+
+                    T_vis = target_maps.shape[1]
+                    Ntok_vis = target_maps.shape[2]
+
+                    fig, axes = plt.subplots(
+                        T_vis, Ntok_vis * 2,
+                        figsize=(4 * Ntok_vis * 2, 4 * T_vis)
+                    )
+
+                    # normalize axes indexing
+                    if T_vis == 1 and Ntok_vis * 2 == 1:
+                        axes = [[axes]]
+                    elif T_vis == 1:
+                        axes = [axes]
+                    elif Ntok_vis * 2 == 1:
+                        axes = [[ax] for ax in axes]
+
+                    for t in range(T_vis):
+                        for k in range(Ntok_vis):
+                            tok_name = token_names[k] if k < len(token_names) else f"tok{k}"
+
+                            raw_map = target_maps[B0, t, k].detach().float().cpu().numpy()
+                            sup_map = support_maps[B0, t, k].detach().float().cpu().numpy()
+
+                            # Left: raw target map
+                            ax_raw = axes[t][2 * k]
+                            im_raw = ax_raw.imshow(raw_map, cmap="viridis")
+                            ax_raw.set_title(f"RAW: {tok_name}, t={t}")
+                            ax_raw.axis("off")
+                            fig.colorbar(im_raw, ax=ax_raw, fraction=0.046, pad=0.04)
+
+                            # Right: support map after spatial softmax
+                            ax_sup = axes[t][2 * k + 1]
+                            im_sup = ax_sup.imshow(sup_map, cmap="hot")
+                            ax_sup.set_title(f"SOFTMAX: {tok_name}, t={t}")
+                            ax_sup.axis("off")
+                            fig.colorbar(im_sup, ax=ax_sup, fraction=0.046, pad=0.04)
+
+                    plt.tight_layout()
+                    save_path = f"OUTDIR-SCALED/DEBUG_SUPPORT_MAPS/temp_softmax_raw_vs_support_step_{step_index}.png"
+                    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+                    plt.close(fig)
+
+                    # also save tensors for later inspection
+                    torch.save(
+                        {
+                            "target_maps": target_maps.detach().cpu(),
+                            "support_maps": support_maps.detach().cpu(),
+                        },
+                        f"OUTDIR-SCALED/DEBUG_SUPPORT_MAPS/temp_softmax_raw_vs_support_step_{step_index}.pt"
+                    )
+
+                    logging.info(f"Saved raw-vs-support comparison to {save_path}")
 
                 # ------------------------------------------------------------------
                 # Pool token-specific features and compute ONE token-feature energy
@@ -594,7 +672,7 @@ def generate_video(
                     E_tok, x_probe, retain_graph=False, create_graph=False
                 )[0]
 
-                g_total_full[:, :guide_k] += g_probe.detach()
+                # g_total_full[:, :guide_k] += g_probe.detach()
                 E_total += float(E_tok.detach().cpu())
 
                 # Minimal logging
